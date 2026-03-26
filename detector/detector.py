@@ -45,22 +45,22 @@ class IntruderDetector:
         self.camera_id = os.getenv("CAMERA_ID", "CAM-01")
         self.alert_cooldown_seconds = int(os.getenv("ALERT_COOLDOWN_SECONDS", "20"))
         self.face_match_tolerance = float(os.getenv("FACE_MATCH_TOLERANCE", "0.48"))
-        self.process_every_n_frames = max(1, int(os.getenv("PROCESS_EVERY_N_FRAMES", "2")))
+        self.process_every_n_frames = max(1, int(os.getenv("PROCESS_EVERY_N_FRAMES", "3")))
         self.frame_resize_scale = float(os.getenv("FRAME_RESIZE_SCALE", "0.4"))
-        self.max_frame_width = int(os.getenv("MAX_FRAME_WIDTH", "800"))
+        self.max_frame_width = int(os.getenv("MAX_FRAME_WIDTH", "640"))
         self.face_detection_upsample = max(
-            0, int(os.getenv("FACE_DETECTION_UPSAMPLE", "1"))
+            0, int(os.getenv("FACE_DETECTION_UPSAMPLE", "0"))
         )
-        self.live_detection_scale = float(os.getenv("LIVE_DETECTION_SCALE", "0.5"))
+        self.live_detection_scale = float(os.getenv("LIVE_DETECTION_SCALE", "0.35"))
         self.live_detection_every_n_frames = max(
-            1, int(os.getenv("LIVE_DETECTION_EVERY_N_FRAMES", "2"))
+            1, int(os.getenv("LIVE_DETECTION_EVERY_N_FRAMES", "3"))
         )
-        self.display_scale = float(os.getenv("DISPLAY_SCALE", "0.8"))
+        self.display_scale = float(os.getenv("DISPLAY_SCALE", "0.7"))
         self.recognition_roi_padding = max(
-            0, int(os.getenv("RECOGNITION_ROI_PADDING", "24"))
+            0, int(os.getenv("RECOGNITION_ROI_PADDING", "16"))
         )
         self.min_recognition_face_size = max(
-            64, int(os.getenv("MIN_RECOGNITION_FACE_SIZE", "180"))
+            64, int(os.getenv("MIN_RECOGNITION_FACE_SIZE", "128"))
         )
         self.unknown_confirmation_frames = max(
             1, int(os.getenv("UNKNOWN_CONFIRMATION_FRAMES", "2"))

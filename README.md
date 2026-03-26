@@ -36,6 +36,17 @@ mvn spring-boot:run
 
 Backend runs on `http://localhost:8080`.
 
+If Maven is not installed on your machine but the project has already been built once, you can use one of the included launchers:
+
+```powershell
+cd backend
+.\run-backend.cmd
+```
+
+PowerShell users can also run `.\run-backend.ps1` if local execution policy allows scripts.
+
+The launchers will try `mvnw`, then `mvn`, and finally fall back to `target/intruder-alert-0.0.1-SNAPSHOT.jar` if it already exists.
+
 ### Frontend
 
 - Node.js 18+
@@ -48,22 +59,31 @@ npm run dev
 
 Frontend runs on `http://localhost:5173`.
 
+On Windows PowerShell, `npm` can be blocked by execution policy because `npm.ps1` is preferred. If that happens, use:
+
+```powershell
+cd frontend
+.\run-frontend.cmd
+```
+
 ### Detector
 
 - Python 3.11 recommended
 
-Install dependencies:
+Recommended Windows setup:
 
 ```powershell
 cd detector
-pip install -r requirements.txt
+.\setup-detector.cmd
 ```
 
 Run:
 
 ```powershell
-python detector.py
+.\run-detector.cmd
 ```
+
+The detector launcher will create `detector/.env` from `.env.example` automatically if it is missing.
 
 ## Notes
 

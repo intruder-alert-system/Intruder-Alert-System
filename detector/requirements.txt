@@ -1,4 +1,10 @@
 opencv-python
-face-recognition
 requests
 python-dotenv
+pillow
+click
+numpy
+face-recognition-models
+dlib-bin
+face-recognition
+setuptools<81
