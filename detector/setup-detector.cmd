@@ -3,9 +3,11 @@ setlocal
 
 set "PROJECT_ROOT=%~dp0"
 set "VENV_PYTHON=%PROJECT_ROOT%.venv\Scripts\python.exe"
+set "VENV_CFG=%PROJECT_ROOT%.venv\pyvenv.cfg"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
+set "RESET_VENV="
 
 if exist "%LocalAppData%\Programs\Python\Python311\python.exe" (
   set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python311\python.exe"
@@ -38,12 +40,23 @@ if not defined PYTHON_EXE (
   exit /b 1
 )
 
+if exist "%VENV_CFG%" (
+  findstr /C:"WindowsApps" "%VENV_CFG%" >nul 2>nul
+  if not errorlevel 1 (
+    set "RESET_VENV=1"
+  )
+)
+
 if exist "%VENV_PYTHON%" (
   call "%VENV_PYTHON%" -c "import sys" >nul 2>nul
   if errorlevel 1 (
-    echo Existing detector virtual environment is broken. Recreating it...
-    rmdir /s /q "%PROJECT_ROOT%.venv"
+    set "RESET_VENV=1"
   )
+)
+
+if defined RESET_VENV (
+  echo Existing detector virtual environment is broken. Recreating it...
+  rmdir /s /q "%PROJECT_ROOT%.venv"
 )
 
 if not exist "%VENV_PYTHON%" (
