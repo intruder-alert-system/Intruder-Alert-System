@@ -1,35 +1,22 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$jarPath = Join-Path $projectRoot "target\intruder-alert-0.0.1-SNAPSHOT.jar"
-$mavenWrapper = Join-Path $projectRoot "mvnw.cmd"
+$venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
+$setupScript = Join-Path $projectRoot "setup-backend.cmd"
+$envFile = Join-Path $projectRoot ".env"
+$envExample = Join-Path $projectRoot ".env.example"
 
-function Test-CommandExists {
-    param([string]$CommandName)
-
-    return $null -ne (Get-Command $CommandName -ErrorAction SilentlyContinue)
-}
-
-if (-not (Test-CommandExists "java")) {
-    Write-Error "Java is not installed or not available on PATH. Install Java 17+ and try again."
-}
-
-if (Test-Path $mavenWrapper) {
-    Write-Host "Starting backend with Maven Wrapper..."
-    & $mavenWrapper "spring-boot:run"
+if (-not (Test-Path $venvPython)) {
+    Write-Host "Backend environment is not ready yet. Running setup first..."
+    & $setupScript
     exit $LASTEXITCODE
 }
 
-if (Test-CommandExists "mvn") {
-    Write-Host "Starting backend with Maven..."
-    & mvn "spring-boot:run"
-    exit $LASTEXITCODE
+if (-not (Test-Path $envFile) -and (Test-Path $envExample)) {
+    Copy-Item $envExample $envFile
+    Write-Host "Created backend\.env from .env.example"
 }
 
-if (Test-Path $jarPath) {
-    Write-Host "Maven is not installed. Starting backend from the existing JAR build..."
-    & java "-jar" $jarPath
-    exit $LASTEXITCODE
-}
-
-Write-Error "Maven is not installed and no built JAR was found at '$jarPath'. Install Maven or add a Maven Wrapper to rebuild the backend."
+Write-Host "Starting FastAPI backend..."
+& $venvPython "-m" "uvicorn" "main:app" "--host" "0.0.0.0" "--port" "8080"
+exit $LASTEXITCODE

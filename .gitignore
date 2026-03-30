@@ -8,5 +8,8 @@ target/
 .idea/
 .vscode/
 *.log
+backend/.env
+backend/data/
+detector/managed_faces/
 detector/.env
 detector/captures/*.jpg

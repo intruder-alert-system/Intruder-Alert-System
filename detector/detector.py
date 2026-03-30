@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import queue
 import threading
@@ -22,9 +23,22 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 KNOWN_FACES_DIR = BASE_DIR / "known_faces"
+MANAGED_FACES_DIR = BASE_DIR / "managed_faces"
 CAPTURES_DIR = BASE_DIR / "captures"
+LOGS_DIR = BASE_DIR / "logs"
 
 cv2.ocl.setUseOpenCL(False)
+
+LOGS_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOGS_DIR / "detector.log", encoding="utf-8"),
+    ],
+)
+LOGGER = logging.getLogger("intruder_detector")
 
 
 class KnownFace:
@@ -42,7 +56,18 @@ class IntruderDetector:
         self.backend_alert_url = os.getenv(
             "BACKEND_ALERT_URL", "http://localhost:8080/api/alerts"
         )
+        self.backend_health_url = os.getenv(
+            "BACKEND_HEALTH_URL", self.backend_alert_url.removesuffix("/api/alerts") + "/api/health"
+        )
+        self.detector_heartbeat_url = os.getenv(
+            "DETECTOR_HEARTBEAT_URL", self.backend_alert_url.removesuffix("/api/alerts") + "/api/detector/heartbeat"
+        )
+        self.detector_faces_url = os.getenv(
+            "DETECTOR_FACES_URL", self.backend_alert_url.removesuffix("/api/alerts") + "/api/detector/faces"
+        )
+        self.detector_api_key = os.getenv("DETECTOR_API_KEY", "change-me-detector-key")
         self.camera_id = os.getenv("CAMERA_ID", "CAM-01")
+        self.camera_index = int(os.getenv("CAMERA_INDEX", "0"))
         self.alert_cooldown_seconds = int(os.getenv("ALERT_COOLDOWN_SECONDS", "20"))
         self.face_match_tolerance = float(os.getenv("FACE_MATCH_TOLERANCE", "0.48"))
         self.process_every_n_frames = max(1, int(os.getenv("PROCESS_EVERY_N_FRAMES", "3")))
@@ -62,6 +87,9 @@ class IntruderDetector:
             1, int(os.getenv("LIVE_DETECTION_EVERY_N_FRAMES", "3"))
         )
         self.display_scale = float(os.getenv("DISPLAY_SCALE", "0.7"))
+        self.display_window_enabled = (
+            os.getenv("DISPLAY_WINDOW_ENABLED", "true").lower() == "true"
+        )
         self.recognition_roi_padding = max(
             0, int(os.getenv("RECOGNITION_ROI_PADDING", "16"))
         )
@@ -81,15 +109,23 @@ class IntruderDetector:
         self.backend_retry_interval_seconds = max(
             1, int(os.getenv("BACKEND_RETRY_INTERVAL_SECONDS", "30"))
         )
+        self.heartbeat_interval_seconds = max(
+            5, int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "15"))
+        )
+        self.face_sync_interval_seconds = max(
+            20, int(os.getenv("FACE_SYNC_INTERVAL_SECONDS", "60"))
+        )
         self.last_alert_time = 0.0
         self.next_backend_retry_time = 0.0
         self.backend_warning_active = False
         self.frame_counter = 0
         self.last_detections: list[dict] = []
         self.last_live_detections: list[dict] = []
+        self.synced_face_versions: dict[int, str] = {}
         self.frame_lock = threading.Lock()
         self.camera_lock = threading.Lock()
         self.results_lock = threading.Lock()
+        self.known_faces_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.alert_queue: queue.Queue = queue.Queue(maxsize=1)
         self.latest_camera_frame = None
@@ -103,10 +139,12 @@ class IntruderDetector:
         self.recognition_result_id = 0
         self.last_seen_result_id = 0
         self.unknown_streak = 0
+        self.last_recognition_summary = ""
         cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
         self.face_cascade = cv2.CascadeClassifier(str(cascade_path))
         if self.face_cascade.empty():
             raise RuntimeError("Could not load OpenCV Haar cascade for live face detection.")
+        MANAGED_FACES_DIR.mkdir(exist_ok=True)
         self.known_faces = self._load_known_faces()
 
     def _person_key_from_path(self, image_path: Path) -> str:
@@ -121,33 +159,39 @@ class IntruderDetector:
     def _load_known_faces(self) -> List[KnownFace]:
         known_faces: List[KnownFace] = []
 
-        for image_path in sorted(KNOWN_FACES_DIR.glob("*")):
-            if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
-                continue
+        for faces_directory in (KNOWN_FACES_DIR, MANAGED_FACES_DIR):
+            for image_path in sorted(faces_directory.glob("*")):
+                try:
+                    if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                        continue
 
-            # Each image file contributes one reference encoding for an authorized person.
-            image = face_recognition.load_image_file(image_path)
-            encodings = face_recognition.face_encodings(image)
+                    # Each image file contributes one reference encoding for an authorized person.
+                    image = face_recognition.load_image_file(image_path)
+                    encodings = face_recognition.face_encodings(image)
 
-            if not encodings:
-                print(f"[WARN] No face found in {image_path.name}. Skipping file.")
-                continue
+                    if not encodings:
+                        LOGGER.warning("No face found in %s. Skipping file.", image_path.name)
+                        continue
 
-            known_faces.append(
-                KnownFace(name=self._person_key_from_path(image_path), encoding=encodings[0])
-            )
+                    known_faces.append(
+                        KnownFace(name=self._person_key_from_path(image_path), encoding=encodings[0])
+                    )
+                    LOGGER.info("Loaded authorized face sample from %s", image_path.name)
+                except Exception as exc:
+                    LOGGER.warning("Could not load %s: %s", image_path.name, exc)
 
-        if not known_faces:
-            raise RuntimeError(
-                "No usable authorized faces found. Add clear photos to known_faces."
-            )
-
-        print(f"[INFO] Loaded {len(known_faces)} authorized face sample(s).")
+        LOGGER.info("Loaded %s authorized face sample(s).", len(known_faces))
         return known_faces
 
     def _recognize_face(self, face_encoding) -> tuple[bool, str]:
+        with self.known_faces_lock:
+            known_faces = list(self.known_faces)
+
+        if not known_faces:
+            return False, "Unknown"
+
         matches = face_recognition.compare_faces(
-            [face.encoding for face in self.known_faces],
+            [face.encoding for face in known_faces],
             face_encoding,
             tolerance=self.face_match_tolerance,
         )
@@ -156,10 +200,10 @@ class IntruderDetector:
             return False, "Unknown"
 
         face_distances = face_recognition.face_distance(
-            [face.encoding for face in self.known_faces], face_encoding
+            [face.encoding for face in known_faces], face_encoding
         )
         best_match_index = face_distances.argmin()
-        return True, self.known_faces[best_match_index].name
+        return True, known_faces[best_match_index].name
 
     def _save_capture(self, frame) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -201,23 +245,28 @@ class IntruderDetector:
         }
 
         try:
-            response = requests.post(self.backend_alert_url, json=payload, timeout=5)
+            response = requests.post(
+                self.backend_alert_url,
+                json=payload,
+                headers={"X-Detector-Key": self.detector_api_key},
+                timeout=5,
+            )
             response.raise_for_status()
             if self.backend_warning_active:
-                print("[INFO] Backend connection restored. Alert delivery resumed.")
+                LOGGER.info("Backend connection restored. Alert delivery resumed.")
             self.backend_warning_active = False
             self.next_backend_retry_time = 0.0
-            print(f"[ALERT] Intruder sent to backend at {timestamp}")
+            LOGGER.info("Intruder sent to backend at %s", timestamp)
         except requests.RequestException as exc:
             retry_at = time.time() + self.backend_retry_interval_seconds
             self.next_backend_retry_time = retry_at
             if not self.backend_warning_active:
-                print(
-                    "[WARN] Alert API is unavailable. "
-                    f"Saved local capture {capture_path.name} and pausing retries for "
-                    f"{self.backend_retry_interval_seconds} seconds."
+                LOGGER.warning(
+                    "Alert API is unavailable. Saved local capture %s and pausing retries for %s seconds.",
+                    capture_path.name,
+                    self.backend_retry_interval_seconds,
                 )
-                print(f"[WARN] Backend request error: {exc}")
+                LOGGER.warning("Backend request error: %s", exc)
             self.backend_warning_active = True
 
     def _play_alert_beep(self) -> None:
@@ -231,14 +280,90 @@ class IntruderDetector:
 
     def _check_backend_connection(self) -> None:
         try:
-            response = requests.get(self.backend_alert_url, timeout=3)
+            response = requests.get(self.backend_health_url, timeout=3)
             response.raise_for_status()
         except requests.RequestException as exc:
-            print(
-                "[WARN] Backend alert API is not reachable at "
-                f"{self.backend_alert_url}. Dashboard snapshots and timestamps will not update."
+            LOGGER.warning(
+                "Backend health endpoint is not reachable at %s. Dashboard snapshots and timestamps will not update.",
+                self.backend_health_url,
             )
-            print(f"[WARN] Backend request error: {exc}")
+            LOGGER.warning("Backend request error: %s", exc)
+
+    def _send_heartbeat(self) -> None:
+        payload = {
+            "cameraId": self.camera_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "alertCooldownSeconds": self.alert_cooldown_seconds,
+        }
+
+        try:
+            requests.post(
+                self.detector_heartbeat_url,
+                json=payload,
+                headers={"X-Detector-Key": self.detector_api_key},
+                timeout=3,
+            ).raise_for_status()
+        except requests.RequestException as exc:
+            LOGGER.warning("Detector heartbeat failed: %s", exc)
+
+    def _sync_managed_faces(self) -> None:
+        try:
+            response = requests.get(
+                self.detector_faces_url,
+                headers={"X-Detector-Key": self.detector_api_key},
+                timeout=5,
+            )
+            response.raise_for_status()
+            faces = response.json()
+        except requests.RequestException:
+            LOGGER.warning("Managed face sync metadata fetch failed.")
+            return
+
+        active_file_names = set()
+
+        for face in faces:
+            face_id = face["id"]
+            display_name = face["displayName"]
+            updated_at = face["updatedAt"]
+            file_name = f"{display_name}_{face_id}.jpg"
+            active_file_names.add(file_name)
+            file_path = MANAGED_FACES_DIR / file_name
+
+            if self.synced_face_versions.get(face_id) == updated_at and file_path.exists():
+                continue
+
+            try:
+                image_response = requests.get(
+                    f"{self.detector_faces_url}/{face_id}/image",
+                    headers={"X-Detector-Key": self.detector_api_key},
+                    timeout=10,
+                )
+                image_response.raise_for_status()
+                file_path.write_bytes(image_response.content)
+                self.synced_face_versions[face_id] = updated_at
+            except requests.RequestException:
+                LOGGER.warning("Managed face image download failed for face id %s", face_id)
+                continue
+
+        for existing_file in MANAGED_FACES_DIR.glob("*"):
+            if existing_file.name not in active_file_names:
+                existing_file.unlink(missing_ok=True)
+
+        active_face_ids = {face["id"] for face in faces}
+        self.synced_face_versions = {
+            face_id: updated_at
+            for face_id, updated_at in self.synced_face_versions.items()
+            if face_id in active_face_ids
+        }
+
+        try:
+            refreshed_faces = self._load_known_faces()
+        except RuntimeError:
+            return
+
+        with self.known_faces_lock:
+            self.known_faces = refreshed_faces
+        LOGGER.info("Managed face sync completed. Authorized faces refreshed.")
 
     def _analyze_frame(self, frame) -> list[dict]:
         live_detections = self._detect_live_faces(frame)
@@ -313,58 +438,113 @@ class IntruderDetector:
 
     def _recognition_worker(self) -> None:
         while not self.stop_event.is_set():
-            frame_to_process = None
+            try:
+                frame_to_process = None
 
-            with self.frame_lock:
-                if self.pending_frame_id > self.last_processed_frame_id:
-                    frame_to_process = self.pending_frame.copy()
-                    self.last_processed_frame_id = self.pending_frame_id
+                with self.frame_lock:
+                    if self.pending_frame_id > self.last_processed_frame_id:
+                        frame_to_process = self.pending_frame.copy()
+                        self.last_processed_frame_id = self.pending_frame_id
 
-            if frame_to_process is None:
-                time.sleep(0.01)
-                continue
+                if frame_to_process is None:
+                    time.sleep(0.01)
+                    continue
 
-            detections = self._analyze_frame(frame_to_process)
+                detections = self._analyze_frame(frame_to_process)
 
-            with self.results_lock:
-                self.last_detections = detections
-                self.last_recognition_time = time.time()
-                self.recognition_result_id += 1
+                with self.results_lock:
+                    self.last_detections = detections
+                    self.last_recognition_time = time.time()
+                    self.recognition_result_id += 1
+
+                if detections:
+                    summary = ", ".join(
+                        detection["name"] if detection["authorized"] else "Unknown"
+                        for detection in detections
+                    )
+                    if summary != self.last_recognition_summary:
+                        LOGGER.info("Recognition update: %s", summary)
+                        self.last_recognition_summary = summary
+                elif self.last_recognition_summary:
+                    LOGGER.info("Recognition update: no faces recognized")
+                    self.last_recognition_summary = ""
+            except Exception as exc:
+                LOGGER.exception("Recognition worker error: %s", exc)
+                time.sleep(0.5)
 
     def _alert_worker(self) -> None:
         while not self.stop_event.is_set():
             try:
-                frame_to_send = self.alert_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+                try:
+                    frame_to_send = self.alert_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
+                try:
+                    self._play_alert_beep()
+                    self._deliver_alert(frame_to_send)
+                finally:
+                    self.alert_queue.task_done()
+            except Exception as exc:
+                LOGGER.exception("Alert worker error: %s", exc)
+                time.sleep(0.5)
+
+    def _heartbeat_worker(self) -> None:
+        while not self.stop_event.is_set():
             try:
-                self._play_alert_beep()
-                self._deliver_alert(frame_to_send)
-            finally:
-                self.alert_queue.task_done()
+                self._send_heartbeat()
+            except Exception as exc:
+                LOGGER.exception("Heartbeat worker error: %s", exc)
+            self.stop_event.wait(self.heartbeat_interval_seconds)
+
+    def _face_sync_worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self._sync_managed_faces()
+            except Exception as exc:
+                LOGGER.exception("Face sync worker error: %s", exc)
+            self.stop_event.wait(self.face_sync_interval_seconds)
 
     def _capture_worker(self, video_capture) -> None:
         while not self.stop_event.is_set():
-            success, frame = video_capture.read()
-            if not success:
-                time.sleep(0.01)
-                continue
+            try:
+                success, frame = video_capture.read()
+                if not success or frame is None:
+                    LOGGER.warning("Webcam frame read failed.")
+                    time.sleep(0.05)
+                    continue
+                if getattr(frame, "size", 0) == 0:
+                    LOGGER.warning("Webcam returned an empty frame.")
+                    time.sleep(0.05)
+                    continue
 
-            with self.camera_lock:
-                self.latest_camera_frame = frame
-                self.camera_frame_id += 1
+                with self.camera_lock:
+                    self.latest_camera_frame = frame
+                    self.camera_frame_id += 1
+            except Exception as exc:
+                LOGGER.exception("Capture worker error: %s", exc)
+                time.sleep(0.5)
 
     def _detect_live_faces(self, frame) -> list[dict]:
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return []
+
         scale = self.live_detection_scale
-        small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-        gray_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(
-            gray_small_frame,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30),
-        )
+        try:
+            small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+            if getattr(small_frame, "size", 0) == 0:
+                return []
+
+            gray_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray_small_frame,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30),
+            )
+        except cv2.error as exc:
+            LOGGER.warning("Live face detection skipped due to OpenCV frame error: %s", exc)
+            return []
 
         live_detections: list[dict] = []
         for left, top, width, height in faces:
@@ -374,6 +554,30 @@ class IntruderDetector:
                     "top": int(top / scale),
                     "right": int((left + width) / scale),
                     "bottom": int((top + height) / scale),
+                }
+            )
+
+        if live_detections:
+            return live_detections
+
+        try:
+            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            fallback_locations = face_recognition.face_locations(
+                rgb_small_frame,
+                number_of_times_to_upsample=max(0, self.face_detection_upsample),
+                model="hog",
+            )
+        except Exception as exc:
+            LOGGER.warning("Fallback face detection failed: %s", exc)
+            return []
+
+        for top, right, bottom, left in fallback_locations:
+            live_detections.append(
+                {
+                    "left": int(left / scale),
+                    "top": int(top / scale),
+                    "right": int(right / scale),
+                    "bottom": int(bottom / scale),
                 }
             )
 
@@ -445,10 +649,11 @@ class IntruderDetector:
 
     def run(self) -> None:
         self._check_backend_connection()
-        video_capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        LOGGER.info("Opening detector camera index %s.", self.camera_index)
+        video_capture = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
 
         if not video_capture.isOpened():
-            raise RuntimeError("Could not open webcam.")
+            raise RuntimeError(f"Could not open webcam at camera index {self.camera_index}.")
 
         video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.max_frame_width)
         video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.max_frame_width * 0.75))
@@ -461,11 +666,15 @@ class IntruderDetector:
             target=self._recognition_worker, daemon=True
         )
         alert_thread = threading.Thread(target=self._alert_worker, daemon=True)
+        heartbeat_thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
+        face_sync_thread = threading.Thread(target=self._face_sync_worker, daemon=True)
         capture_thread.start()
         recognition_thread.start()
         alert_thread.start()
+        heartbeat_thread.start()
+        face_sync_thread.start()
 
-        print("[INFO] Detector started. Press 'q' to quit.")
+        LOGGER.info("Detector started. Press 'q' to quit.")
 
         try:
             while True:
@@ -476,7 +685,7 @@ class IntruderDetector:
                         frame = self.latest_camera_frame.copy()
                         self.last_displayed_camera_frame_id = self.camera_frame_id
 
-                if frame is None:
+                if frame is None or getattr(frame, "size", 0) == 0:
                     time.sleep(0.005)
                     continue
 
@@ -579,23 +788,33 @@ class IntruderDetector:
                     2,
                 )
 
-                display_frame = frame
-                if 0 < self.display_scale < 1:
-                    display_frame = cv2.resize(
-                        frame, (0, 0), fx=self.display_scale, fy=self.display_scale
-                    )
+                if self.display_window_enabled:
+                    display_frame = frame
+                    if 0 < self.display_scale < 1:
+                        display_frame = cv2.resize(
+                            frame, (0, 0), fx=self.display_scale, fy=self.display_scale
+                        )
 
-                cv2.imshow("Smart Intruder Alert System", display_frame)
+                    cv2.imshow("Smart Intruder Alert System", display_frame)
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                else:
+                    time.sleep(0.01)
+        except Exception as exc:
+            LOGGER.exception("Detector main loop crashed: %s", exc)
+            raise
         finally:
             self.stop_event.set()
             capture_thread.join(timeout=1)
             recognition_thread.join(timeout=1)
             alert_thread.join(timeout=1)
+            heartbeat_thread.join(timeout=1)
+            face_sync_thread.join(timeout=1)
             video_capture.release()
-            cv2.destroyAllWindows()
+            if self.display_window_enabled:
+                cv2.destroyAllWindows()
+            LOGGER.info("Detector shut down.")
 
 
 if __name__ == "__main__":

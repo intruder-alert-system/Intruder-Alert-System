@@ -1,10 +1,17 @@
 package com.techsutra.intruderalert.model;
 
+import jakarta.validation.constraints.NotBlank;
+
 public class AlertRequest {
+    @NotBlank
     private String cameraId;
+    @NotBlank
     private String timestamp;
+    @NotBlank
     private String imageBase64;
+    @NotBlank
     private String fileName;
+    @NotBlank
     private String message;
 
     public String getCameraId() {
